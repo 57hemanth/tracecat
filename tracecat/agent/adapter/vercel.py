@@ -62,6 +62,7 @@ from pydantic_core import to_json
 from tracecat.agent.approvals.enums import ApprovalStatus
 from tracecat.agent.common.stream_types import (
     StreamEventType,
+    ToolCallContent,
     UnifiedStreamEvent,
     parse_vercel_frame_cursor,
 )
@@ -89,6 +90,22 @@ if TYPE_CHECKING:
     from tracecat.chat.schemas import ChatMessage
 # Using a type alias for ProviderMetadata since its structure is not defined.
 ProviderMetadata = dict[str, dict[str, Any]]
+
+
+def _approval_item_to_data_part(item: ToolCallContent) -> dict[str, Any]:
+    """Convert a stream approval item into the UI approval-card payload."""
+    data: dict[str, Any] = {
+        "tool_call_id": item.id,
+        "tool_name": item.name,
+        "args": strip_proxy_tool_metadata(item.input),
+    }
+    if item.status is not None:
+        data["status"] = item.status
+    if item.decision is not None:
+        data["decision"] = item.decision
+    if item.reason is not None:
+        data["reason"] = item.reason
+    return data
 
 
 def _extract_structured_error(output: Any) -> str | None:
@@ -1089,11 +1106,7 @@ class VercelStreamContext:
                     yield DataEventPayload(
                         type=APPROVAL_DATA_PART_TYPE,
                         data=[
-                            {
-                                "tool_call_id": item.id,
-                                "tool_name": item.name,
-                                "args": strip_proxy_tool_metadata(item.input),
-                            }
+                            _approval_item_to_data_part(item)
                             for item in event.approval_items
                         ],
                     )
@@ -1581,6 +1594,9 @@ def convert_chat_messages_to_ui(
         # These are inserted by list_messages() when loading session history
         if chat_message.kind == MessageKind.APPROVAL_REQUEST and chat_message.approval:
             approval = chat_message.approval
+            # Skip resolved approval requests: once approved/rejected, the tool
+            # call and its result render normally in the timeline, so the
+            # approval card would be a redundant duplicate.
             if approval.status != ApprovalStatus.PENDING:
                 continue
             # Create an assistant message with the approval data part
@@ -1590,6 +1606,9 @@ def convert_chat_messages_to_ui(
                 "tool_call_id": approval.tool_call_id,
                 "tool_name": tool_name,
                 "args": approval.tool_call_args or {},
+                "status": approval.status.value,
+                "decision": approval.decision,
+                "reason": approval.reason,
             }
             mutable_message = MutableMessage(
                 id=chat_message.id,

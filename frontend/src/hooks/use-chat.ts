@@ -22,6 +22,7 @@ import {
   type AgentSessionsRemoveSessionArtifactResponse,
   type AgentSessionUpdate,
   type ApiError,
+  type ApprovalStatus,
   agentSessionsCreateSession,
   agentSessionsDeleteSession,
   agentSessionsGetSession,
@@ -551,6 +552,9 @@ export type ApprovalCard = {
   tool_call_id: string
   tool_name: string
   args?: unknown
+  status?: ApprovalStatus
+  decision?: boolean | Record<string, unknown> | null
+  reason?: string | null
 }
 
 /**

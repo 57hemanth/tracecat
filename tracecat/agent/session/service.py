@@ -6,10 +6,10 @@ import contextlib
 import copy
 import hashlib
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import orjson
 from pydantic_ai.messages import (
@@ -37,6 +37,11 @@ import tracecat.agent.adapter.vercel
 import tracecat.artifacts.projection as artifact_projection
 from tracecat import config
 from tracecat.agent.approvals.enums import ApprovalStatus
+from tracecat.agent.common.stream_types import (
+    ApprovalStreamStatus,
+    ToolCallContent,
+    UnifiedStreamEvent,
+)
 from tracecat.agent.common.types import MCPServerConfig
 from tracecat.agent.llm import LLMCompletionError
 from tracecat.agent.mcp.metadata import sanitize_message_tool_inputs
@@ -62,6 +67,7 @@ from tracecat.agent.session.types import (
     TurnLifecycle,
     TurnLifecycleResult,
 )
+from tracecat.agent.stream.connector import AgentStream
 from tracecat.agent.subagents import (
     ResolvedAgentsConfig,
 )
@@ -94,6 +100,7 @@ from tracecat.db.models import (
     Approval,
     Case,
     Chat,
+    User,
     Workflow,
 )
 from tracecat.dsl.client import get_temporal_client
@@ -127,6 +134,52 @@ class SessionHistoryData:
     sdk_session_id: str
     sdk_session_data: str
     is_fork: bool = False  # If True, SDK should use fork_session=True
+
+
+def _approval_decision_fields(
+    result: Any,
+    *,
+    approved_by: uuid.UUID | None,
+    decision_metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Map a deferred approval result into Approval row update fields."""
+    status: ApprovalStatus
+    reason: str | None = None
+    decision: bool | dict[str, Any] | None = None
+
+    match result:
+        case bool(value):
+            status = ApprovalStatus.APPROVED if value else ApprovalStatus.REJECTED
+            decision = value
+        case ToolApproved(override_args=override_args):
+            status = ApprovalStatus.APPROVED
+            decision = {"kind": "tool-approved"}
+            if override_args is not None:
+                decision["override_args"] = override_args
+        case ToolDenied(message=message):
+            status = ApprovalStatus.REJECTED
+            reason = message
+            decision = {"kind": "tool-denied"}
+            if message:
+                decision["message"] = message
+        case _:
+            raise ValueError(f"Unsupported approval result: {type(result)}")
+
+    if decision_metadata:
+        if isinstance(decision, dict):
+            decision = {**decision, "metadata": decision_metadata}
+        elif isinstance(decision, bool):
+            decision = {"value": decision, "metadata": decision_metadata}
+        else:
+            decision = {"metadata": decision_metadata}
+
+    return {
+        "status": status,
+        "reason": reason,
+        "decision": decision,
+        "approved_by": approved_by,
+        "approved_at": datetime.now(tz=UTC),
+    }
 
 
 @dataclass(frozen=True)
@@ -1023,6 +1076,122 @@ class AgentSessionService(BaseWorkspaceService):
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none() is not None
 
+    async def _apply_submitted_approval_decisions(
+        self,
+        *,
+        session_id: uuid.UUID,
+        approval_map: Mapping[str, Any],
+        decision_metadata: Mapping[str, dict[str, Any]],
+    ) -> None:
+        """Persist accepted approval decisions before the full set resumes."""
+        if not approval_map:
+            return
+
+        tool_call_ids = list(approval_map)
+        stmt = (
+            select(Approval)
+            .where(
+                Approval.workspace_id == self.workspace_id,
+                Approval.session_id == session_id,
+                Approval.tool_call_id.in_(tool_call_ids),
+            )
+            .with_for_update()
+        )
+        result = await self.session.execute(stmt)
+        approvals_by_tool_id = {
+            approval.tool_call_id: approval for approval in result.scalars().all()
+        }
+        approved_by = await self._existing_user_id(self.role.user_id)
+
+        for tool_call_id, approval_result in approval_map.items():
+            approval = approvals_by_tool_id.get(tool_call_id)
+            if approval is None:
+                logger.warning(
+                    "Accepted approval decision has no persisted approval row",
+                    session_id=str(session_id),
+                    tool_call_id=tool_call_id,
+                )
+                continue
+            for field, value in _approval_decision_fields(
+                approval_result,
+                approved_by=approved_by,
+                decision_metadata=decision_metadata.get(tool_call_id),
+            ).items():
+                setattr(approval, field, value)
+
+        await self.session.commit()
+
+    async def _existing_user_id(self, user_id: uuid.UUID | None) -> uuid.UUID | None:
+        """Return ``user_id`` only when it can satisfy Approval.approved_by."""
+        if user_id is None:
+            return None
+        stmt = select(User).where(cast(Any, User.id) == user_id)
+        result = await self.session.execute(stmt)
+        user = result.scalar_one_or_none()
+        return user.id if user else None
+
+    async def _approval_stream_items(
+        self,
+        *,
+        session_id: uuid.UUID,
+        tool_call_ids: Sequence[str],
+    ) -> list[ToolCallContent]:
+        """Return the active approval batch as stream items for UI replay.
+
+        Only pending approvals plus the just-submitted ``tool_call_ids`` are
+        replayed. Terminal approvals from earlier turns must stay out of the
+        payload: the client drops an entire ``data-approval-request`` part when
+        any contained tool call already has a terminal tool state, which would
+        hide the still-pending cards.
+        """
+        stmt = (
+            select(Approval)
+            .where(
+                Approval.workspace_id == self.workspace_id,
+                Approval.session_id == session_id,
+                or_(
+                    Approval.status == ApprovalStatus.PENDING,
+                    Approval.tool_call_id.in_(tool_call_ids),
+                ),
+            )
+            .order_by(Approval.created_at, Approval.id)
+        )
+        result = await self.session.execute(stmt)
+        return [
+            ToolCallContent(
+                id=approval.tool_call_id,
+                name=approval.tool_name,
+                input=approval.tool_call_args or {},
+                status=cast(ApprovalStreamStatus, approval.status.value),
+                decision=approval.decision,
+                reason=approval.reason,
+            )
+            for approval in result.scalars().all()
+        ]
+
+    async def _emit_approval_idle_segment(
+        self,
+        *,
+        session_id: uuid.UUID,
+        stream_id: uuid.UUID | None,
+        tool_call_ids: Sequence[str],
+    ) -> None:
+        """Emit the latest approval state and a non-terminal Redis boundary."""
+        if self.workspace_id is None:
+            return
+        stream = await AgentStream.new(
+            workspace_id=self.workspace_id,
+            session_id=session_id,
+            stream_id=stream_id,
+        )
+        if approval_items := await self._approval_stream_items(
+            session_id=session_id, tool_call_ids=tool_call_ids
+        ):
+            await stream.append(
+                UnifiedStreamEvent.approval_request_event(approval_items).to_dict()
+            )
+        await stream.finish_idle_segment()
+
     async def claim_external_channel_approval_sink(
         self,
         *,
@@ -1050,11 +1219,13 @@ class AgentSessionService(BaseWorkspaceService):
         workspace_id: uuid.UUID,
         session_id: uuid.UUID,
         run_id: uuid.UUID,
-        tool_call_ids: Sequence[str],
+        approval_map: Mapping[str, Any],
     ) -> str:
-        digest = hashlib.sha256(
-            ",".join(sorted(tool_call_ids)).encode("utf-8")
-        ).hexdigest()[:16]
+        # Key by the tool-call set only, never the decision content: the first
+        # accepted submission for a given set must win, so a concurrent
+        # submission with a *different* decision for the same tools dedupes
+        # against it instead of overwriting it.
+        digest = hashlib.sha256(orjson.dumps(sorted(approval_map))).hexdigest()[:16]
         return f"agent-approval-submit:{workspace_id}:{session_id}:{run_id}:{digest}"
 
     async def auto_title_session_on_first_prompt(
@@ -1549,7 +1720,7 @@ class AgentSessionService(BaseWorkspaceService):
                 workspace_id=self.workspace_id,
                 session_id=session_id,
                 run_id=curr_run_id,
-                tool_call_ids=tuple(approval_map.keys()),
+                approval_map=approval_map,
             )
             try:
                 dedup_client = await get_redis_client()
@@ -1611,16 +1782,30 @@ class AgentSessionService(BaseWorkspaceService):
                     await dedup_client.delete(dedup_key)
             raise
 
+        did_resume = resumed is not False
+        if resumed is False:
+            await self._apply_submitted_approval_decisions(
+                session_id=session_id,
+                approval_map=approval_map,
+                decision_metadata=decision_metadata,
+            )
+            await self._emit_approval_idle_segment(
+                session_id=session_id,
+                stream_id=agent_session.active_stream_id,
+                tool_call_ids=list(approval_map),
+            )
+
         logger.info(
             "Approval decisions submitted successfully",
             workflow_id=str(workflow_id),
             session_id=str(session_id),
-            resumed=bool(resumed),
+            resumed=did_resume,
+            raw_resumed=resumed,
         )
 
         return ApprovalContinuationResponse(
             curr_run_id=curr_run_id,
-            resumed=bool(resumed),
+            resumed=did_resume,
         )
 
     @contextlib.asynccontextmanager

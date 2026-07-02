@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import orjson
 import pytest
-from pydantic_ai.tools import ToolApproved
+from pydantic_ai.tools import ToolApproved, ToolDenied
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1055,6 +1055,7 @@ async def test_run_turn_continue_with_inbox_source_for_non_external_session(
         entity_type=AgentSessionEntity.AGENT_PRESET.value,
         entity_id=uuid.uuid4(),
         curr_run_id=curr_run_id,
+        active_stream_id=uuid.uuid4(),
     )
     session.add(agent_session)
     session.add(
@@ -1155,6 +1156,10 @@ async def test_run_turn_continue_partial_approval_reports_not_resumed(
         set_if_not_exists=AsyncMock(return_value=True),
         delete=AsyncMock(return_value=1),
     )
+    fake_stream = SimpleNamespace(
+        append=AsyncMock(return_value=None),
+        finish_idle_segment=AsyncMock(return_value=None),
+    )
     with (
         patch(
             "tracecat.agent.session.service.get_temporal_client",
@@ -1164,6 +1169,10 @@ async def test_run_turn_continue_partial_approval_reports_not_resumed(
             "tracecat.agent.session.service.get_redis_client",
             AsyncMock(return_value=fake_redis),
         ),
+        patch(
+            "tracecat.agent.session.service.AgentStream.new",
+            AsyncMock(return_value=fake_stream),
+        ),
     ):
         result = await service.run_turn(agent_session.id, continuation)
 
@@ -1172,6 +1181,134 @@ async def test_run_turn_continue_partial_approval_reports_not_resumed(
         resumed=False,
     )
     fake_handle.execute_update.assert_awaited_once()
+    fake_stream.append.assert_awaited_once()
+    fake_stream.finish_idle_segment.assert_awaited_once()
+
+    approved = await session.scalar(
+        select(Approval).where(
+            Approval.session_id == agent_session.id,
+            Approval.tool_call_id == "tool_call_123",
+        )
+    )
+    assert approved is not None
+    assert approved.status is ApprovalStatus.APPROVED
+    assert approved.decision == {"value": True, "metadata": {"source": "inbox"}}
+
+    pending = await session.scalar(
+        select(Approval).where(
+            Approval.session_id == agent_session.id,
+            Approval.tool_call_id == "tool_call_456",
+        )
+    )
+    assert pending is not None
+    assert pending.status is ApprovalStatus.PENDING
+
+
+@pytest.mark.anyio
+async def test_run_turn_continue_old_worker_none_defaults_to_resumed(
+    session: AsyncSession,
+    svc_role: Role,
+) -> None:
+    curr_run_id = uuid.uuid4()
+    agent_session = AgentSession(
+        id=uuid.uuid4(),
+        title="Preset chat",
+        workspace_id=svc_role.workspace_id,
+        entity_type=AgentSessionEntity.AGENT_PRESET.value,
+        entity_id=uuid.uuid4(),
+        curr_run_id=curr_run_id,
+        active_stream_id=uuid.uuid4(),
+    )
+    session.add(agent_session)
+    session.add(
+        Approval(
+            workspace_id=svc_role.workspace_id,
+            session_id=agent_session.id,
+            tool_call_id="tool_call_123",
+            tool_name="core.http_request",
+            tool_call_args={"url": "https://example.com"},
+            status=ApprovalStatus.PENDING,
+        )
+    )
+    await session.commit()
+    await session.refresh(agent_session)
+
+    service = AgentSessionService(session=session, role=svc_role)
+    continuation = ContinueRunRequest(
+        decisions=[
+            ApprovalDecision(
+                tool_call_id="tool_call_123",
+                action="approve",
+            )
+        ],
+        source="inbox",
+    )
+
+    fake_handle = SimpleNamespace(execute_update=AsyncMock(return_value=None))
+    get_workflow_handle_for = Mock(return_value=fake_handle)
+    fake_client = SimpleNamespace(get_workflow_handle_for=get_workflow_handle_for)
+    fake_redis = SimpleNamespace(
+        set_if_not_exists=AsyncMock(return_value=True),
+        delete=AsyncMock(return_value=1),
+    )
+    stream_new = AsyncMock()
+    with (
+        patch(
+            "tracecat.agent.session.service.get_temporal_client",
+            AsyncMock(return_value=fake_client),
+        ),
+        patch(
+            "tracecat.agent.session.service.get_redis_client",
+            AsyncMock(return_value=fake_redis),
+        ),
+        patch("tracecat.agent.session.service.AgentStream.new", stream_new),
+    ):
+        result = await service.run_turn(agent_session.id, continuation)
+
+    assert result == ApprovalContinuationResponse(
+        curr_run_id=curr_run_id,
+        resumed=True,
+    )
+    fake_handle.execute_update.assert_awaited_once()
+    stream_new.assert_not_awaited()
+
+
+def test_approval_dedup_key_ignores_decision_content() -> None:
+    """First submission wins per tool-call set: conflicting decisions for the
+    same tools must produce the same dedup key so they cannot overwrite each
+    other, while a different tool-call set gets its own key."""
+    workspace_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+
+    approved_key = AgentSessionService._approval_dedup_key(
+        workspace_id=workspace_id,
+        session_id=session_id,
+        run_id=run_id,
+        approval_map={"tool_call_123": True},
+    )
+    denied_key = AgentSessionService._approval_dedup_key(
+        workspace_id=workspace_id,
+        session_id=session_id,
+        run_id=run_id,
+        approval_map={"tool_call_123": ToolDenied(message="No")},
+    )
+    reordered_key = AgentSessionService._approval_dedup_key(
+        workspace_id=workspace_id,
+        session_id=session_id,
+        run_id=run_id,
+        approval_map={"tool_call_456": True, "tool_call_123": True},
+    )
+    same_reordered_key = AgentSessionService._approval_dedup_key(
+        workspace_id=workspace_id,
+        session_id=session_id,
+        run_id=run_id,
+        approval_map={"tool_call_123": True, "tool_call_456": True},
+    )
+
+    assert approved_key == denied_key
+    assert reordered_key == same_reordered_key
+    assert approved_key != reordered_key
 
 
 @pytest.mark.anyio
